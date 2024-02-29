@@ -47,4 +47,4 @@ while data.time < duration:
         frames.append(pixels)
 
 # Simulate and display video.
-media.write_video('./mujoco-playground.mp4', frames, fps=framerate)
+media.write_video("./mujoco-playground.mp4", frames, fps=framerate)

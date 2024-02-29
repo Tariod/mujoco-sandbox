@@ -1,4 +1,0 @@
-mediapy==1.2.0
-mujoco==3.1.2
-numpy==1.26.4
-reactivex==4.0.4

@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "mujoco-sandbox"
+version = "0.1.0"
+description = "mujoco-sandbox"
+authors = ["Tariod <mykhailovdmt@gmail.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+mediapy = "^1.2.0"
+mujoco = "^3.1.2"
+numpy = "^1.26.4"
+python = "^3.9"
+reactivex = "^4.0.4"
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.2.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

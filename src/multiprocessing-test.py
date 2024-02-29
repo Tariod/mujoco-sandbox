@@ -13,7 +13,7 @@ def init_worker(read_connection, calculate_latency):
 
     def calculate(it):
         sleep(calculate_latency)
-        return {'id': it['id'], 'start_time': it['start_time'], 'end_time': time()}
+        return {"id": it["id"], "start_time": it["start_time"], "end_time": time()}
 
     worker = source.pipe(ops.map(calculate))
 
@@ -26,37 +26,38 @@ def init_worker(read_connection, calculate_latency):
     source.on_completed()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     RATE = 0.1
     TAKE = 10
     GENERATE_LATENCY = 0.05
     CALCULATE_LATENCY = 0.05
 
-    ctx = mp.get_context('spawn')
+    ctx = mp.get_context("spawn")
     read_connection, write_connection = ctx.Pipe(duplex=False)
 
-
     def init_value(id):
-        return {'id': id, 'start_time': time()}
-
+        return {"id": id, "start_time": time()}
 
     def generate(it):
         sleep(GENERATE_LATENCY)
         return it
 
-
     generate_scheduler = schedulers.ThreadPoolScheduler(5)
-    source = interval(RATE).pipe(ops.take(TAKE), ops.map(init_value), ops.observe_on(generate_scheduler),
-                                 ops.map(generate))
+    source = interval(RATE).pipe(
+        ops.take(TAKE),
+        ops.map(init_value),
+        ops.observe_on(generate_scheduler),
+        ops.map(generate),
+    )
     worker = ctx.Process(target=init_worker, args=(read_connection, CALCULATE_LATENCY))
-
 
     def send_value(it):
         write_connection.send(it)
         return it
 
-
-    def close_write_connection(observer: abc.ObserverBase[Any], scheduler: Optional[abc.SchedulerBase] = None):
+    def close_write_connection(
+        observer: abc.ObserverBase[Any], scheduler: Optional[abc.SchedulerBase] = None
+    ):
         _scheduler = scheduler or schedulers.ImmediateScheduler.singleton()
 
         def action(_: abc.SchedulerBase, __: Any) -> None:
@@ -66,8 +67,9 @@ if __name__ == '__main__':
 
         return _scheduler.schedule(action)
 
-
-    simulation = concat(source.pipe(ops.map(send_value)), create(close_write_connection))
+    simulation = concat(
+        source.pipe(ops.map(send_value)), create(close_write_connection)
+    )
 
     worker.start()
     simulation.pipe(ops.do_action(lambda it: print("Source: ", it))).run()
