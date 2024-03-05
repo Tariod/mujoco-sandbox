@@ -1,0 +1,14 @@
+services:
+  mujoco-main:
+    build:
+      context: .
+    command: main.py
+    environment:
+      - NETWORK_LATENCY=0.01
+      - NETWORK_LATENCY_VARIANCE=0.01
+      - RATE=0.025
+      - TAKE=100
+      - STRATEGY=default
+      - VERBOSE=True
+    volumes:
+      - ./data:/usr/src/mujoco-sandbox/data:rw

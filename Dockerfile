@@ -11,8 +11,8 @@ COPY pyproject.toml poetry.lock ./
 
 RUN poetry install --without dev
 
-COPY . .
+COPY src .
 
 ENTRYPOINT ["poetry", "run", "python"]
 
-CMD ["src/main.py"]
+CMD ["main.py"]

@@ -1,6 +1,8 @@
+from distutils.util import strtobool
 import mujoco
 import multiprocessing as mp
 import numpy as np
+import os
 import random
 import time
 
@@ -138,14 +140,7 @@ def init_physics_engine_worker(
     source.on_completed()
 
 
-def run(
-    rate=0.025,
-    take=100,
-    network_latency=0.01,
-    network_latency_variance=0.01,
-    strategy=Strategy.DEFAULT,
-    verbose=True,
-):
+def run(rate, take, network_latency, network_latency_variance, strategy, verbose):
     pendulum_xml = """
     <mujoco>
       <worldbody>
@@ -188,4 +183,22 @@ def run(
 
 
 if __name__ == "__main__":
-    run()
+    get_strategy = lambda name: {it.value: it for it in Strategy}.get(name)
+
+    strategy_name = os.environ.get("STRATEGY", Strategy.DEFAULT.value)
+    strategy = get_strategy(strategy_name)
+    if strategy is None:
+        raise ValueError(
+            f"STRATEGY must be one of the following values: ${[it.value for it in Strategy]}"
+        )
+
+    run(
+        rate=float(os.environ.get("RATE", 0.025)),
+        take=int(os.environ.get("TAKE", 100)),
+        network_latency=float(os.environ.get("NETWORK_LATENCY", 0.01)),
+        network_latency_variance=float(
+            os.environ.get("NETWORK_LATENCY_VARIANCE", 0.01)
+        ),
+        strategy=strategy,
+        verbose=strtobool(os.environ.get("VERBOSE", "True")),
+    )
