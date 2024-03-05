@@ -1,168 +1,191 @@
-import json
 import mujoco
+import multiprocessing as mp
 import numpy as np
 import random
-import threading
 import time
 
-from reactivex import create, interval, of
+from reactivex import concat, create, interval, of
 from reactivex import operators as ops
-from reactivex.scheduler import ThreadPoolScheduler
+from reactivex import scheduler as schedulers
+from reactivex import subject as subjects
+from strategies import strategies, Strategy
+from utils import dump_experiment, log_step
 
 
-def log(action, value, verbose):
-    if verbose:
-        print(
-            f"{action}: {value}, Thread: {threading.current_thread().name}, Time: {time.time()}"
-        )
-
-
-xml = """
-<mujoco>
-  <worldbody>
-    <body name='box_and_sphere' euler='0 0 -30'>
-      <joint name='swing' type='hinge' axis='0 1 0' pos='0 0 1' />
-      <geom name='cord' type='cylinder' size='.02 1' mass='0' />
-      <geom name='bob' type='sphere' pos='0 0 -1' mass='1' size='.1' />
-    </body>
-  </worldbody>
-</mujoco>
-"""
-
-
-class RemoteSource:
-    def __init__(self, rate, take, latency, latency_variance, verbose):
-        self.__verbose = verbose
-        self.__model = mujoco.MjModel.from_xml_string(xml)
+class Simulation:
+    def __init__(self, model_xml, init_model_state, rate, take, verbose):
+        self.__model = mujoco.MjModel.from_xml_string(model_xml)
         self.__model.opt.timestep = rate
         self.__model_data = mujoco.MjData(self.__model)
-        self.__model_data.qpos = np.ones_like(self.__model_data.qpos) * np.pi / 2
-
-        source_scheduler = ThreadPoolScheduler(1)
-        self.__simulation = interval(rate, scheduler=source_scheduler).pipe(
-            ops.map(lambda it: self.__mj_step(it)),
-            ops.do_action(lambda it: log("Emitted", it, self.__verbose)),
+        init_model_state(self.__model_data)
+        self.__simulation = interval(rate).pipe(
             ops.take(take),
-            ops.publish(),
+            ops.map(self.__mj_step),
+            ops.do_action(lambda it: log_step("Emitted", it) if verbose else None),
         )
-        self.__remote_simulation = self.__simulation.pipe(
-            ops.flat_map(
-                lambda it: of(it).pipe(
-                    ops.delay(
-                        max(0, random.normalvariate(mu=latency, sigma=latency_variance))
-                    )
+
+    def __mj_step(self, id):
+        qpos = list(self.__model_data.qpos.copy())
+        qvel = list(self.__model_data.qvel.copy())
+        mujoco.mj_step(self.__model, self.__model_data)
+        qfrc_bias = list(self.__model_data.qfrc_bias.copy())
+        start_time = time.time_ns()
+        return {
+            "id": id,
+            "qpos": qpos,
+            "qvel": qvel,
+            "qfrc_bias": qfrc_bias,
+            "start_time": start_time,
+        }
+
+    def pipe(self, *operators):
+        return self.__simulation.pipe(*operators)
+
+    def run(self):
+        return self.__simulation.run()
+
+
+class NetworkSimulation:
+    def __init__(self, source, connection, latency, latency_variance):
+        self.__simulation = concat(
+            source.pipe(
+                self.__delay(latency, latency_variance), self.__send(connection)
+            ),
+            self.__close_connection(connection),
+        )
+
+    def __delay(self, latency, latency_variance):
+        return ops.flat_map(
+            lambda it: of(it).pipe(
+                ops.delay(
+                    max(0, random.normalvariate(mu=latency, sigma=latency_variance))
                 )
             )
         )
 
-    def __mj_step(self, index):
-        qpos = self.__model_data.qpos.copy()
-        qvel = self.__model_data.qvel.copy()
-        mujoco.mj_step(self.__model, self.__model_data)
-        return {
-            "id": index,
-            "qpos": qpos,
-            "qvel": qvel,
-            "qfrc_bias": self.__model_data.qfrc_bias.copy(),
-            "time": time.time(),
-        }
+    def __send(self, connection):
+        def send_inner(value):
+            connection.send(value)
+            return value
 
-    def pipe(self, *operators):
-        return self.__remote_simulation.pipe(*operators)
+        return ops.map(send_inner)
 
-    def start(self):
-        self.__simulation.connect()
+    def __close_connection(self, connection):
+        def close_connection_inner(observer, scheduler=None):
+            _scheduler = scheduler or schedulers.ImmediateScheduler.singleton()
+
+            def handle_close(_, __) -> None:
+                connection.send(None)
+                connection.close()
+                observer.on_completed()
+
+            return _scheduler.schedule(handle_close)
+
+        return create(close_connection_inner)
+
+    def run(self):
+        return self.__simulation.run()
 
 
 class PhysicsEngine:
-    def __init__(self, source, strategy, rate, verbose):
-        self.__rate = rate
-        self.__verbose = verbose
-        self.results = []
-        mujoco_scheduler = ThreadPoolScheduler(1)
+    def __init__(self, source, model, strategy, verbose):
+        self.__model = model
         self.__physics_engine = source.pipe(
-            ops.do_action(lambda it: log("Received", it, self.__verbose)),
+            ops.map(lambda it: {**it, "received_time": time.time_ns()}),
+            ops.do_action(lambda it: log_step("Received", it) if verbose else None),
             strategy(),
-            ops.observe_on(mujoco_scheduler),
             ops.map(self.__calculate),
-            ops.do_action(lambda it: self.results.append(it)),
+            ops.do_action(lambda it: log_step("Calculated", it) if verbose else None),
         )
 
     def __calculate(self, value):
-        model = mujoco.MjModel.from_xml_string(xml)
-        model.opt.timestep = self.__rate
+        model = mujoco.MjModel.from_xml_string(self.__model["xml"])
+        model.opt.timestep = self.__model["rate"]
         model_data = mujoco.MjData(model)
+
         model_data.qpos = value["qpos"]
         model_data.qvel = value["qvel"]
         # model_data.qacc = value['qacc']
 
         mujoco.mj_inverse(model, model_data)
 
-        return {
-            "id": value["id"],
-            "qfrc_bias": list(value["qfrc_bias"]),
-            "qfrc_inverse": list(model_data.qfrc_inverse.copy()),
-            "start_time": value["time"],
-            "end_time": time.time(),
-        }
+        qfrc_inverse = list(model_data.qfrc_inverse.copy())
+        end_time = time.time_ns()
+        return {**value, "qfrc_inverse": qfrc_inverse, "end_time": end_time}
 
-    def __dump(self):
-        print("Done!")
-        with open("./sample.json", "w") as outfile:
-            json.dump(self.results, outfile, indent=4)
+    def pipe(self, *operators):
+        return self.__physics_engine.pipe(*operators)
 
     def subscribe(self):
-        return self.__physics_engine.subscribe(
-            on_next=lambda it: log("Calculated", it, self.__verbose),
-            on_completed=lambda: self.__dump(),
-        )
+        return self.__physics_engine.subscribe()
 
 
-def default_strategy(key="id"):
-    def default_strategy_inner(source):
-        def subscribe(observer, scheduler=None):
-            lock = threading.RLock()
-            current_index, buffer = 0, {}
+def init_physics_engine_worker(
+    connection, model, strategy_name, dump_file_path, verbose
+):
+    source = subjects.Subject()
 
-            def on_next(value):
-                nonlocal current_index, buffer
-                index = value[key]
-                with lock:
-                    if index != current_index:
-                        buffer[index] = value
-                    else:
-                        current_index += 1
-                        observer.on_next(value)
-                        while len(buffer) > 0 and current_index in buffer:
-                            observer.on_next(buffer.pop(current_index))
-                            current_index += 1
+    strategy = strategies[strategy_name]
+    physics_engine = PhysicsEngine(source, model, strategy, verbose)
+    physics_engine = physics_engine.pipe(dump_experiment(dump_file_path))
 
-            return source.subscribe(
-                on_next, observer.on_error, observer.on_completed, scheduler=scheduler
-            )
+    physics_engine.subscribe()
 
-        return create(subscribe)
-
-    return default_strategy_inner
+    msg = connection.recv()
+    while msg is not None:
+        source.on_next(msg)
+        msg = connection.recv()
+    source.on_completed()
 
 
 def run(
-    rate=0.02,
-    take=50,
-    network_latency=0.005,
-    network_latency_variance=0.005,
-    verbose=False,
+    rate=0.025,
+    take=100,
+    network_latency=0.01,
+    network_latency_variance=0.01,
+    strategy=Strategy.DEFAULT,
+    verbose=True,
 ):
-    remote_source = RemoteSource(
-        rate, take, network_latency, network_latency_variance, verbose
+    pendulum_xml = """
+    <mujoco>
+      <worldbody>
+        <body name='box_and_sphere' euler='0 0 -30'>
+          <joint name='swing' type='hinge' axis='0 1 0' pos='0 0 1' />
+          <geom name='cord' type='cylinder' size='.02 1' mass='0' />
+          <geom name='bob' type='sphere' pos='0 0 -1' mass='1' size='.1' />
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+
+    dump_file_path = f"./data/pendulum_exp_{time.time_ns()}_rate_{rate}_latency_{network_latency}_variance_{network_latency_variance}_strategy_{strategy.value}.csv"
+
+    def init_model_state(model_data):
+        model_data.qpos = np.ones_like(model_data.qpos) * np.pi / 2
+
+    simulation = Simulation(pendulum_xml, init_model_state, rate, take, verbose)
+
+    ctx = mp.get_context("spawn")
+    consumer_connection, producer_connection = ctx.Pipe(duplex=False)
+
+    delayed_simulation = NetworkSimulation(
+        simulation, producer_connection, network_latency, network_latency_variance
     )
-    physics_engine = PhysicsEngine(remote_source, default_strategy, rate, verbose)
-    physics_engine.subscribe()
-    if verbose:
-        print(f"Start Thread: {threading.current_thread().name}, Time: {time.time()}")
-    remote_source.start()
+
+    physics_engine_process = ctx.Process(
+        target=init_physics_engine_worker,
+        args=(
+            consumer_connection,
+            {"xml": pendulum_xml, "rate": rate},
+            strategy,
+            dump_file_path,
+            verbose,
+        ),
+    )
+
+    physics_engine_process.start()
+    delayed_simulation.run()
 
 
 if __name__ == "__main__":
     run()
-    input()
